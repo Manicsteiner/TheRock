@@ -1,0 +1,127 @@
+name: Build Private Windows PyTorch Wheels CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_pytorch_wheels:
+    name: Build PyTorch
+    runs-on: windows-latest
+    timeout-minutes: 1380 # for 23 hours
+    strategy:
+      matrix:
+        python_version: ["3.14"]
+        pytorch_git_ref: ["release/2.13"]
+        artifact_group: ["gfx1150"]
+    env:
+      CHECKOUT_ROOT: D:/a/src
+      PACKAGE_DIST_DIR: ${{ github.workspace }}\output\packages\dist
+      optional_build_prod_arguments: ""
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "therockbot"
+          git config --global user.email "therockbot@amd.com"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Select Python version
+        run: |
+          python build_tools/github_actions/python_to_cp_version.py \
+            --python-version ${{ matrix.python_version }}
+
+      - name: Install ninja and pip requirements
+        run: |
+          choco install --no-progress -y ninja --version 1.13.1 --force
+          choco install --no-progress -y sccache
+          echo "sccache version: $(sccache --version)"
+          pip install packaging
+          pip install -r external-builds/pytorch/requirements-ci.txt
+
+      # Build a fixed version of libuv from source, no matter the pytorch ref.
+      # gloo requires >= 1.26; v1.47.0 matches upstream's source build.
+      # https://github.com/pytorch/pytorch/blob/main/.ci/pytorch/windows/arm64/bootstrap_libuv.bat
+      - name: Build libuv from source for GLOO
+        run: |
+          git clone https://github.com/libuv/libuv.git -b v1.47.0 --depth 1
+          cmake -S libuv -B libuv/build -DBUILD_TESTING=OFF
+          cmake --build libuv/build --config Release
+          cmake --install libuv/build --prefix "${{ github.workspace }}/libuv-install"
+          echo "libuv_ROOT=${{ github.workspace }}/libuv-install" >> $GITHUB_ENV
+
+      # After other installs, so MSVC gets priority in the PATH.
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Checkout PyTorch source (stable)
+        run: |
+          git config --global core.longpaths true
+          python ./external-builds/pytorch/pytorch_torch_repo.py checkout \
+            --checkout-dir ${{ env.CHECKOUT_ROOT }}/torch \
+            --gitrepo-origin https://github.com/ROCm/pytorch.git \
+            --repo-hashtag ${{ matrix.pytorch_git_ref }} \
+            --no-commit-hipify
+
+#      - name: Checkout PyTorch Audio source
+#        run: |
+#          git config --global core.longpaths true
+#          python ./external-builds/pytorch/pytorch_audio_repo.py checkout \
+#            --require-related-commit \
+#            --checkout-dir ${{ env.CHECKOUT_ROOT }}/audio \
+#            --torch-dir ${{ env.CHECKOUT_ROOT }}/torch
+
+      - name: Checkout PyTorch Vision source
+        run: |
+          git config --global core.longpaths true
+          python ./external-builds/pytorch/pytorch_vision_repo.py checkout \
+            --require-related-commit \
+            --checkout-dir ${{ env.CHECKOUT_ROOT }}/vision \
+            --torch-dir ${{ env.CHECKOUT_ROOT }}/torch \
+            --no-commit-hipify
+
+      # Determine optional arguments passed to `build_prod_wheels.py`
+      # - name: Pip install
+      #   run: |
+      #     pip install packaging
+      #     pip install -r requirements.txt
+
+      - name: Build PyTorch wheels
+        shell: cmd
+        run: |
+          echo "Building PyTorch wheels for ${{ matrix.artifact_group }}"
+          python ./external-builds/pytorch/build_prod_wheels.py ^
+            build ^
+            --install-rocm ^
+            --index-url "https://rocm.nightlies.amd.com/v2/${{ matrix.artifact_group }}/" ^
+            --root-checkout-dir ${{ env.CHECKOUT_ROOT }} ^
+            --pytorch-dir ${{ env.CHECKOUT_ROOT }}/torch ^
+            --pytorch-vision-dir ${{ env.CHECKOUT_ROOT }}/vision ^
+            --enable-pytorch-flash-attention-windows ^
+            --output-dir ${{ env.PACKAGE_DIST_DIR }} ^
+            --use-ccache ^
+            --pytorch-rocm-arch ${{ matrix.artifact_group }}
+
+      - name: Sanity check wheel
+        shell: cmd
+        run: |
+          python external-builds/pytorch/sanity_check_wheel.py ${{ env.PACKAGE_DIST_DIR }}
+
+      - name: Upload wheels to GitHub
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-win-${{ matrix.python_version }}-${{ matrix.artifact_group }}
+          path: ${{ env.PACKAGE_DIST_DIR }}
+
